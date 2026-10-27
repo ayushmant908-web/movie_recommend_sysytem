@@ -2,6 +2,7 @@
 import os
 import pickle
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import requests
@@ -31,7 +32,9 @@ movies = pd.read_pickle(
 ).reset_index(drop=True)
 
 if "title" not in movies.columns:
-    raise ValueError("movie_list.pkl must contain a 'title' column.")
+    raise ValueError(
+        "movie_list.pkl must contain a 'title' column."
+    )
 
 with open(
     os.path.join(BASE_DIR, "top5_simaliarity.pkl"), "rb"
@@ -41,22 +44,16 @@ with open(
 
 # ---------------- FETCH TMDB POSTER ----------------
 
-
-
-# ---------------- FETCH TMDB POSTER ----------------
-
 @lru_cache(maxsize=2048)
 def fetch_poster(movie_id, movie_title=""):
 
     if not TMDB_API_KEY:
-        print("ERROR: TMDB_API_KEY is missing in .env")
+        print("ERROR: TMDB_API_KEY is missing.")
         return None
 
-    headers = {
-        "accept": "application/json"
-    }
+    title = str(movie_title).strip()
 
-    def get_poster(data):
+    def extract_poster(data):
         poster_path = data.get("poster_path")
 
         if poster_path:
@@ -64,11 +61,12 @@ def fetch_poster(movie_id, movie_title=""):
 
         return None
 
-    # Step 1: Try using TMDB movie ID
-    if movie_id is not None and str(movie_id).strip():
+    # Step 1: Fetch poster using TMDB numeric ID
+    if movie_id is not None:
 
         try:
             if not pd.isna(movie_id):
+
                 numeric_id = int(float(movie_id))
 
                 response = requests.get(
@@ -77,30 +75,32 @@ def fetch_poster(movie_id, movie_title=""):
                         "api_key": TMDB_API_KEY,
                         "language": "en-US"
                     },
-                    headers=headers,
-                    timeout=10
+                    timeout=(3, 5)
                 )
 
                 print(
-                    f"ID lookup: {movie_title} | "
-                    f"ID: {numeric_id} | "
+                    f"ID lookup: {title} | "
                     f"Status: {response.status_code}"
                 )
 
                 if response.status_code == 200:
-                    poster_url = get_poster(response.json())
+                    poster_url = extract_poster(response.json())
 
                     if poster_url:
                         return poster_url
 
-        except (ValueError, TypeError, OverflowError):
-            print("Invalid TMDB ID:", movie_id)
+        except (
+            ValueError,
+            TypeError,
+            OverflowError
+        ):
+            print("Invalid movie ID:", movie_id)
 
         except requests.RequestException as e:
             print("TMDB ID request failed:", e)
 
-    # Step 2: If ID lookup fails, search by movie title
-    if not movie_title or not str(movie_title).strip():
+    # Step 2: Search by title if ID lookup fails
+    if not title:
         return None
 
     try:
@@ -108,50 +108,48 @@ def fetch_poster(movie_id, movie_title=""):
             "https://api.themoviedb.org/3/search/movie",
             params={
                 "api_key": TMDB_API_KEY,
-                "query": str(movie_title).strip(),
+                "query": title,
                 "include_adult": "false",
                 "language": "en-US",
                 "page": 1
             },
-            headers=headers,
-            timeout=10
+            timeout=(3, 5)
         )
 
         print(
-            f"Title search: {movie_title} | "
+            f"Title search: {title} | "
             f"Status: {response.status_code}"
         )
 
         if response.status_code != 200:
-            print("TMDB search error:", response.text[:200])
+            print(
+                "TMDB search error:",
+                response.text[:200]
+            )
             return None
 
         results = response.json().get("results", [])
 
-        if not results:
-            print("No TMDB result for:", movie_title)
-            return None
+        # Prefer an exact title match with a poster
+        target = title.casefold()
 
-        # Prefer an exact title match
-        target = str(movie_title).strip().casefold()
-
-        exact_matches = [
-            result for result in results
-            if result.get("title", "").strip().casefold() == target
-            and result.get("poster_path")
-        ]
-
-        if exact_matches:
-            return get_poster(exact_matches[0])
-
-        # Otherwise, use the first result that has a poster
         for result in results:
-            poster_url = get_poster(result)
+            result_title = result.get("title", "").strip()
+
+            if (
+                result_title.casefold() == target
+                and result.get("poster_path")
+            ):
+                return extract_poster(result)
+
+        # Otherwise, use the first result with a poster
+        for result in results:
+            poster_url = extract_poster(result)
 
             if poster_url:
                 return poster_url
 
-        print("No poster available for:", movie_title)
+        print("No poster available:", title)
         return None
 
     except requests.RequestException as e:
@@ -165,17 +163,25 @@ def prepare_movie(row):
 
     movie = row.to_dict()
 
-    # Support common movie ID column names
     movie_id = None
 
+    # Support common ID column names
     for column in (
-        "movie_id", "tmdb_id", "tmdbId", "movieId", "id"
+        "movie_id",
+        "tmdb_id",
+        "tmdbId",
+        "movieId",
+        "id"
     ):
         value = movie.get(column)
 
-        if value is not None and not pd.isna(value):
-            movie_id = value
-            break
+        if value is not None:
+            try:
+                if not pd.isna(value):
+                    movie_id = value
+                    break
+            except (TypeError, ValueError):
+                continue
 
     movie_title = str(movie.get("title", "")).strip()
 
@@ -189,13 +195,33 @@ def prepare_movie(row):
 
 # ---------------- HOME: TOP 50 ----------------
 
-@app.route("/")
+@app.route("/", methods=["GET", "HEAD"])
 def home():
 
-    home_movies = [
-        prepare_movie(row)
-        for _, row in movies.head(50).iterrows()
+    # Respond quickly to Render health checks
+    if request.method == "HEAD":
+        return "", 200
+
+    rows = [
+        row for _, row in movies.head(50).iterrows()
     ]
+
+    # Fetch posters concurrently instead of sequentially
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        prepared_movies = list(
+            executor.map(prepare_movie, rows)
+        )
+
+    # Show only movies with available poster URLs
+    home_movies = [
+        movie for movie in prepared_movies
+        if movie.get("poster_url")
+    ]
+
+    print(
+        f"Home: {len(home_movies)} movies "
+        "have posters."
+    )
 
     return render_template(
         "index.html",
@@ -228,7 +254,9 @@ def recommendation():
         ].tolist()
 
         if not matches:
-            error = "Movie not found. Please select another movie."
+            error = (
+                "Movie not found. Please select another movie."
+            )
 
         else:
             movie_index = matches[0]
@@ -238,22 +266,39 @@ def recommendation():
                 top_movies.get(str(movie_index), [])
             )
 
-            for idx in indices:
+            seen_indices = {movie_index}
 
-                if len(recommendations) >= 5:
-                    break
+            for idx in indices:
 
                 try:
                     idx = int(idx)
                 except (ValueError, TypeError):
                     continue
 
-                if 0 <= idx < len(movies) and idx != movie_index:
-                    row = movies.iloc[idx]
-                    recommendations.append(prepare_movie(row))
+                if idx in seen_indices:
+                    continue
+
+                seen_indices.add(idx)
+
+                if not (0 <= idx < len(movies)):
+                    continue
+
+                movie = prepare_movie(movies.iloc[idx])
+
+                # Skip movies without posters
+                if not movie.get("poster_url"):
+                    continue
+
+                recommendations.append(movie)
+
+                if len(recommendations) >= 5:
+                    break
 
             if not recommendations:
-                error = "No recommendations found for this movie."
+                error = (
+                    "No recommendations with available posters "
+                    "were found. Please try another movie."
+                )
 
     return render_template(
         "index.html",
@@ -289,7 +334,7 @@ def contact():
             error = "Please enter a valid email address."
 
         else:
-            # Demo only: the message is not saved or emailed.
+            # Demo only: message is not saved or emailed
             success = True
 
     return render_template(
@@ -303,7 +348,11 @@ def contact():
 # ---------------- RUN APPLICATION ----------------
 
 if __name__ == "__main__":
-    print("TMDB API key loaded:", bool(TMDB_API_KEY))
+    print(
+        "TMDB API key loaded:",
+        bool(TMDB_API_KEY)
+    )
+
     app.run(debug=True)
 
 
